@@ -1,0 +1,214 @@
+import os, re
+import pandas as pd, numpy as np
+from openpyxl import load_workbook
+
+# === CONFIG ===
+base_dir = r"D:\SUMO Files for Calgary Simulation\All Simulations"  # <-- set this
+
+sheet_to_col = {
+    "dynamicinitial":"dynamicinitial","dynamicpoststep1":"dynamicpoststep1","dynamicpoststep2":"dynamicpoststep2",
+    "dynamicraininitial":"dynamicraininitial","dynamicrainstep1":"dynamicrainstep1","dynamicrainstep2":"dynamicrainstep2",
+    "dynamicrainstep3":"dynamicrainstep3","dynamicrainstep4":"dynamicrainstep4","dynamicrainstep5":"dynamicrainstep5",
+    "dynamicrainstep6":"dynamicrainstep6","dynamicstep1":"dynamicstep1","dynamicstep2":"dynamicstep2","dynamicstep3":"dynamicstep3",
+    "dynamicstep4":"dynamicstep4","dynamicstep5":"dynamicstep5","dynamicstep6":"dynamicstep6"
+}
+
+simulation_types = [
+    "1600 vehicles (8-8)","1600 vehicles (15-15)","1600 vehicles (20-20)",
+    "3000 vehicles (8-8)","3000 vehicles (15-15)","3000 vehicles (20-20)",
+    "5000 vehicles (8-8)","5000 vehicles (15-15)","5000 vehicles (20-20)",
+    "10000 vehicles (8-8)","10000 vehicles (15-15)","10000 vehicles (20-20)",
+    "20000 vehicles (8-8)","20000 vehicles (15-15)","20000 vehicles (20-20)",
+    "40000 vehicles (20-20)"
+]
+
+# Columns to export from the chosen run (weighted + per-type + totals)
+export_cols = [
+    # Weighted (computed here)
+    "Weighted Avg Delay (min)",
+    "Weighted Avg TimeLoss (min)",
+    "Weighted Avg Speed (km/h)",
+    "Weighted Avg Route Length (km)",
+    "Weighted Avg Travel Time (min)",
+    "Weighted Avg Waiting Time (min)",
+    "Overall Avg Route Length (km)",      # = Total Km / Total Completed
+
+    # Totals / counts
+    "Total Kilometers Traveled (All)",
+    "Total Expected Vehicles",
+    "Total Inserted Vehicles",
+    "Total Completed Vehicles",
+    "Total Missing Vehicles",
+    "Total Inserted Not Completed",
+    "Total Lost+Uninserted Vehicles",
+
+    # Per-type means (mins, km, km/h)
+    "Avg Delay Passenger (min)","Avg TimeLoss Passenger (min)","Avg Travel Time Passenger (min)",
+    "Avg Waiting Time Passenger (min)","Avg Route Length Passenger (km)","Avg Speed Passenger (km/h)","Total Kilometers Passenger",
+
+    "Avg Delay Truck (min)","Avg TimeLoss Truck (min)","Avg Travel Time Truck (min)",
+    "Avg Waiting Time Truck (min)","Avg Route Length Truck (km)","Avg Speed Truck (km/h)","Total Kilometers Truck",
+
+    "Avg Delay Bus (min)","Avg TimeLoss Bus (min)","Avg Travel Time Bus (min)",
+    "Avg Waiting Time Bus (min)","Avg Route Length Bus (km)","Avg Speed Bus (km/h)","Total Kilometers Bus",
+
+    # Per-type counts (weights)
+    "Completed Passenger","Completed Truck","Completed Bus"
+]
+
+# Metrics used for selecting "closest to mean" (z-scored)
+distance_metrics = [
+    "Weighted Avg Delay (min)",
+    "Weighted Avg TimeLoss (min)",
+    "Weighted Avg Speed (km/h)",
+    "Overall Avg Route Length (km)",
+    "Total Lost+Uninserted Vehicles",
+    "Total Kilometers Traveled (All)"
+]
+
+def extract_sim_key(folder_name):
+    nm = folder_name.lower().replace("_"," ")
+    m = re.search(r'(\d{4,5})\s*vehicles.*\(\s*(\d+)\s*-\s*(\d+)\s*\)', nm)
+    if not m: return None
+    vc, od = m.group(1), f"{m.group(2)}-{m.group(3)}"
+    for sim in simulation_types:
+        if sim.startswith(f"{vc} vehicles") and od in sim:
+            return sim
+    return None
+
+def safe_get(df, col):
+    return df.get(col, pd.Series(np.nan, index=df.index))
+
+def wavg_rowwise(values_mat: pd.DataFrame, weights_mat: pd.DataFrame) -> pd.Series:
+    vals = values_mat.to_numpy(dtype=float)
+    wts  = weights_mat.to_numpy(dtype=float)
+    out = []
+    for i in range(vals.shape[0]):
+        v, w = vals[i, :], wts[i, :]
+        mask = (~np.isnan(v)) & (~np.isnan(w)) & (w > 0)
+        out.append(float(np.sum(v[mask]*w[mask]) / np.sum(w[mask])) if mask.any() else np.nan)
+    return pd.Series(out, index=values_mat.index, dtype="float")
+
+# Store chosen run per scenario/sim
+selected = {sc: {s: None for s in simulation_types} for sc in sheet_to_col.values()}
+
+for folder in os.listdir(base_dir):
+    folder_path = os.path.join(base_dir, folder)
+    if not os.path.isdir(folder_path): continue
+
+    summary_file = os.path.join(folder_path, "customized_summary_output.xlsx")
+    if not os.path.exists(summary_file): continue
+
+    sim_label = extract_sim_key(folder)
+    if not sim_label: continue
+
+    wb = load_workbook(summary_file, data_only=True)
+    for sheet in wb.sheetnames:
+        if not sheet.endswith("_Summary"): continue
+        key = sheet.replace("_Summary","").lower()
+        if key not in sheet_to_col: continue
+        scenario = sheet_to_col[key]
+
+        ws = wb[sheet]
+        headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+        try:
+            sim_idx = headers.index("Simulation")
+        except ValueError:
+            continue
+
+        rows = []
+        for r in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
+            sim_name = str(r[sim_idx]) if r[sim_idx] is not None else ""
+            if sim_name.lower().startswith("sim_"):
+                row = {"Simulation": sim_name}
+                for ci, colname in enumerate(headers):
+                    if colname: row[colname] = r[ci]
+                rows.append(row)
+        if not rows: continue
+
+        df = pd.DataFrame(rows)
+
+        # Ensure presence of columns we rely on
+        needed = [
+            # per-type means
+            "Avg Delay Passenger (min)","Avg Delay Truck (min)","Avg Delay Bus (min)",
+            "Avg TimeLoss Passenger (min)","Avg TimeLoss Truck (min)","Avg TimeLoss Bus (min)",
+            "Avg Travel Time Passenger (min)","Avg Travel Time Truck (min)","Avg Travel Time Bus (min)",
+            "Avg Waiting Time Passenger (min)","Avg Waiting Time Truck (min)","Avg Waiting Time Bus (min)",
+            "Avg Route Length Passenger (km)","Avg Route Length Truck (km)","Avg Route Length Bus (km)",
+            "Avg Speed Passenger (km/h)","Avg Speed Truck (km/h)","Avg Speed Bus (km/h)",
+            # per-type totals/weights
+            "Completed Passenger","Completed Truck","Completed Bus",
+            # totals
+            "Total Kilometers Traveled (All)","Total Completed Vehicles",
+            "Total Missing Vehicles","Total Inserted Not Completed"
+        ]
+        for c in needed:
+            if c not in df.columns: df[c] = np.nan
+
+        # Combined lost + uninserted
+        df["Total Lost+Uninserted Vehicles"] = (
+            df["Total Missing Vehicles"].fillna(0) +
+            df["Total Inserted Not Completed"].fillna(0)
+        )
+
+        # Weighted averages (by completed counts)
+        comp = pd.concat([
+            safe_get(df,"Completed Passenger"),
+            safe_get(df,"Completed Truck"),
+            safe_get(df,"Completed Bus")
+        ], axis=1)
+        comp.columns = ["P","T","B"]
+
+        def wcol(names):
+            mat = pd.concat([safe_get(df, n) for n in names], axis=1)
+            mat.columns = ["P","T","B"]
+            return wavg_rowwise(mat, comp)
+
+        df["Weighted Avg Delay (min)"]        = wcol(["Avg Delay Passenger (min)","Avg Delay Truck (min)","Avg Delay Bus (min)"])
+        df["Weighted Avg TimeLoss (min)"]     = wcol(["Avg TimeLoss Passenger (min)","Avg TimeLoss Truck (min)","Avg TimeLoss Bus (min)"])
+        df["Weighted Avg Speed (km/h)"]       = wcol(["Avg Speed Passenger (km/h)","Avg Speed Truck (km/h)","Avg Speed Bus (km/h)"])
+        df["Weighted Avg Route Length (km)"]  = wcol(["Avg Route Length Passenger (km)","Avg Route Length Truck (km)","Avg Route Length Bus (km)"])
+        df["Weighted Avg Travel Time (min)"]  = wcol(["Avg Travel Time Passenger (min)","Avg Travel Time Truck (min)","Avg Travel Time Bus (min)"])
+        df["Weighted Avg Waiting Time (min)"] = wcol(["Avg Waiting Time Passenger (min)","Avg Waiting Time Truck (min)","Avg Waiting Time Bus (min)"])
+
+        # Overall average route length from totals
+        with np.errstate(divide='ignore', invalid='ignore'):
+            df["Overall Avg Route Length (km)"] = (
+                df.get("Total Kilometers Traveled (All)", np.nan) /
+                df.get("Total Completed Vehicles", np.nan)
+            )
+
+        # --- Select run closest to mean (z-score on distance_metrics) ---
+        feat = df[distance_metrics].astype(float)
+        feat = feat.apply(lambda c: c.fillna(c.mean()), axis=0).fillna(0.0)  # impute means
+        means, stds = feat.mean(), feat.std(ddof=0).replace(0, np.nan)
+        z = (feat - means) / stds
+        z = z.fillna(0.0)
+
+        dists = np.sqrt((z ** 2).sum(axis=1))
+        best_idx = int(dists.idxmin())
+        chosen = df.loc[best_idx]
+
+        # Record chosen run with all requested metrics
+        rec = {"SelectedRun": chosen["Simulation"]}
+        for c in export_cols:
+            rec[c] = chosen.get(c, np.nan)
+        selected[scenario][sim_label] = rec
+
+# === WRITE OUTPUT ===
+out_path = os.path.join(base_dir, "final_selected_metrics_dynamic_ALL_closest_to_mean.xlsx")
+with pd.ExcelWriter(out_path) as writer:
+    for scenario in sheet_to_col.values():
+        rows = []
+        for sim in simulation_types:
+            rec = selected[scenario][sim]
+            if rec is None: continue
+            row = {"Simulation Type": sim, "Chosen Run": rec["SelectedRun"]}
+            for c in export_cols:
+                row[c] = rec.get(c, np.nan)
+            rows.append(row)
+        if rows:
+            pd.DataFrame(rows).to_excel(writer, sheet_name=scenario, index=False)
+
+print(f"\n✅ Wrote ALL metrics (delay, time loss, speed, distance, lost+uninserted) from the single run closest to mean to:\n{out_path}")
