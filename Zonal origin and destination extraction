@@ -1,0 +1,340 @@
+import os, re
+import pandas as pd, numpy as np
+from openpyxl import load_workbook
+
+# =========================
+# CONFIGURATION
+# =========================
+base_dir = r"D:\SUMO Files for Calgary Simulation\All SImulations"  # <-- verify exact spelling/case
+
+# If per-TAZ workbook is not present in each sim folder, fall back to a global one:
+USE_GLOBAL_TAZ_BOOK_IF_MISSING = True
+GLOBAL_TAZ_BOOK = os.path.join(base_dir, "customized_summary_output_TAZ_withPenalty.xlsx")
+
+# Map workbook sheet name stem -> scenario key
+sheet_to_col = {
+    "dynamicinitial":     "dynamicinitial",
+    "dynamicpoststep1":   "dynamicpoststep1",
+    "dynamicpoststep2":   "dynamicpoststep2",
+    "dynamicraininitial": "dynamicraininitial",
+    "dynamicrainstep1":   "dynamicrainstep1",
+    "dynamicrainstep2":   "dynamicrainstep2",
+    "dynamicrainstep3":   "dynamicrainstep3",
+    "dynamicrainstep4":   "dynamicrainstep4",
+    "dynamicrainstep5":   "dynamicrainstep5",
+    "dynamicrainstep6":   "dynamicrainstep6",
+    "dynamicstep1":       "dynamicstep1",
+    "dynamicstep2":       "dynamicstep2",
+    "dynamicstep3":       "dynamicstep3",
+    "dynamicstep4":       "dynamicstep4",
+    "dynamicstep5":       "dynamicstep5",
+    "dynamicstep6":       "dynamicstep6",
+}
+
+# Short aliases used inside your per-TAZ file for sheet names
+SHORT_ALIAS = {
+    "dynamicinitial": "dyn_init",
+    "dynamicstep1": "dyn_s1",
+    "dynamicstep2": "dyn_s2",
+    "dynamicstep3": "dyn_s3",
+    "dynamicstep4": "dyn_s4",
+    "dynamicstep5": "dyn_s5",
+    "dynamicstep6": "dyn_s6",
+    "dynamicraininitial": "rain_init",
+    "dynamicrainstep1": "rain_s1",
+    "dynamicrainstep2": "rain_s2",
+    "dynamicrainstep3": "rain_s3",
+    "dynamicrainstep4": "rain_s4",
+    "dynamicrainstep5": "rain_s5",
+    "dynamicrainstep6": "rain_s6",
+    "dynamicpoststep1": "post_s1",
+    "dynamicpoststep2": "post_s2_combo",  # adjust if different
+}
+
+simulation_types = [
+    "1600 vehicles (8-8)", "1600 vehicles (15-15)", "1600 vehicles (20-20)",
+    "3000 vehicles (8-8)", "3000 vehicles (15-15)", "3000 vehicles (20-20)",
+    "5000 vehicles (8-8)", "5000 vehicles (15-15)", "5000 vehicles (20-20)",
+    "10000 vehicles (8-8)", "10000 vehicles (15-15)", "10000 vehicles (20-20)",
+    "20000 vehicles (8-8)", "20000 vehicles (15-15)", "20000 vehicles (20-20)",
+    "40000 vehicles (20-20)"
+]
+
+# Metrics used for "closest to mean" selection (weighted where applicable)
+DISTANCE_METRICS = [
+    "Weighted Avg Delay (min)",
+    "Weighted Avg TimeLoss (min)",
+    "Weighted Avg Speed (km/h)",
+    "Overall Avg Route Length (km)",
+    "Total Lost+Uninserted Vehicles",
+    "Total Kilometers Traveled (All)",
+]
+
+# =========================
+# HELPERS
+# =========================
+def extract_sim_key(folder_name: str):
+    nm = folder_name.lower().replace("_", " ")
+    m = re.search(r'(\d{4,5})\s*vehicles.*\(\s*(\d+)\s*-\s*(\d+)\s*\)', nm)
+    if not m: return None
+    vc, od = m.group(1), f"{m.group(2)}-{m.group(3)}"
+    for sim in simulation_types:
+        if sim.startswith(f"{vc} vehicles") and od in sim:
+            return sim
+    return None
+
+def normalize_sim_label(s):
+    """Accept Sim_2 or Sim_02 -> Sim_2"""
+    s = "" if s is None else str(s).strip()
+    if s.lower().startswith("sim_"):
+        try:
+            n = int(s.split("_", 1)[1])
+            return f"Sim_{n}"
+        except Exception:
+            return s
+    return s
+
+def safe_get(df, col):
+    return df.get(col, pd.Series(np.nan, index=df.index))
+
+def wavg_rowwise(values_mat: pd.DataFrame, weights_mat: pd.DataFrame) -> pd.Series:
+    vals = values_mat.to_numpy(dtype=float)
+    wts  = weights_mat.to_numpy(dtype=float)
+    out = []
+    for i in range(vals.shape[0]):
+        v, w = vals[i, :], wts[i, :]
+        mask = (~np.isnan(v)) & (~np.isnan(w)) & (w > 0)
+        out.append(float(np.sum(v[mask]*w[mask]) / np.sum(w[mask])) if mask.any() else np.nan)
+    return pd.Series(out, index=values_mat.index, dtype="float")
+
+def taz_sheet_candidates(group_key: str, perspective: str):
+    alias = SHORT_ALIAS.get(group_key, group_key)
+    cands = [
+        f"{alias}_TAZ_{perspective}",
+        f"{group_key}_TAZ_{perspective}",
+        f"{group_key[:20]}_TAZ_{perspective}",  # 31-char Excel sheet name limit safety
+    ]
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
+def open_taz_book(folder_path):
+    local_path = os.path.join(folder_path, "customized_summary_output_TAZ_withPenalty.xlsx")
+    if os.path.exists(local_path):
+        try:
+            wb = load_workbook(local_path, read_only=True)
+            return local_path, wb.sheetnames
+        except Exception as e:
+            print(f"  ⚠️ Could not open local TAZ workbook: {local_path} -> {e}")
+
+    if USE_GLOBAL_TAZ_BOOK_IF_MISSING and os.path.exists(GLOBAL_TAZ_BOOK):
+        try:
+            wb = load_workbook(GLOBAL_TAZ_BOOK, read_only=True)
+            print(f"  ℹ️ Using GLOBAL per-TAZ workbook: {GLOBAL_TAZ_BOOK}")
+            return GLOBAL_TAZ_BOOK, wb.sheetnames
+        except Exception as e:
+            print(f"  ⚠️ Could not open GLOBAL TAZ workbook: {GLOBAL_TAZ_BOOK} -> {e}")
+    return None, []
+
+def find_best_sheet_name(available_sheets, group_key, perspective):
+    for cand in taz_sheet_candidates(group_key, perspective):
+        if cand in available_sheets:
+            return cand
+    suffix = f"_TAZ_{perspective}"
+    matches = [s for s in available_sheets if s.endswith(suffix)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+def read_per_taz_block(taz_path, sheet_name, sim_row_label):
+    try:
+        df = pd.read_excel(taz_path, sheet_name=sheet_name)
+    except Exception as e:
+        print(f"    ⚠️ Failed to read sheet '{sheet_name}' in {taz_path}: {e}")
+        return pd.DataFrame()
+    if "Simulation" not in df.columns:
+        print(f"    ⚠️ Sheet '{sheet_name}' has no 'Simulation' column.")
+        return pd.DataFrame()
+    df["_SimNorm"] = df["Simulation"].astype(str).map(normalize_sim_label)
+    sim_norm = normalize_sim_label(sim_row_label)
+    out = df[df["_SimNorm"] == sim_norm].drop(columns=["_SimNorm"], errors="ignore").copy()
+    if "TAZ" in out.columns:
+        try:
+            out["TAZ"] = out["TAZ"].astype(int)
+            out = out.sort_values("TAZ").reset_index(drop=True)
+        except Exception:
+            pass
+    if out.empty:
+        print(f"    ⚠️ No rows for Simulation='{sim_row_label}' in sheet '{sheet_name}'.")
+    return out
+
+# =========================
+# STEP 1: Choose the single run (Sim_k) CLOSEST TO MEAN per scenario & simulation folder
+# =========================
+def choose_run_closest_to_mean(summary_path):
+    """
+    Returns mapping: scenario_key -> (chosen_run_label, chosen_row_series)
+    Uses DISTANCE_METRICS in z-score space. Computes weighted metrics on-the-fly.
+    """
+    chosen = {}
+
+    wb = load_workbook(summary_path, data_only=True)
+    for sheet in wb.sheetnames:
+        if not sheet.endswith("_Summary"): 
+            continue
+
+        key = sheet.replace("_Summary", "").lower()
+        if key not in sheet_to_col:
+            continue
+        scenario = sheet_to_col[key]
+
+        # Build df of Sim_* rows
+        ws = wb[sheet]
+        headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+        try:
+            sim_idx = headers.index("Simulation")
+        except ValueError:
+            continue
+
+        rows = []
+        for r in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
+            sim_name = str(r[sim_idx]) if r[sim_idx] is not None else ""
+            if sim_name.lower().startswith("sim_"):
+                row = {headers[i]: r[i] for i in range(len(headers)) if headers[i]}
+                rows.append(row)
+
+        if not rows:
+            continue
+
+        df = pd.DataFrame(rows)
+
+        # Ensure required columns exist (fill with NaN if missing)
+        need = [
+            "Avg Delay Passenger (min)","Avg Delay Truck (min)","Avg Delay Bus (min)",
+            "Avg TimeLoss Passenger (min)","Avg TimeLoss Truck (min)","Avg TimeLoss Bus (min)",
+            "Avg Speed Passenger (km/h)","Avg Speed Truck (km/h)","Avg Speed Bus (km/h)",
+            "Avg Route Length Passenger (km)","Avg Route Length Truck (km)","Avg Route Length Bus (km)",
+            "Avg Travel Time Passenger (min)","Avg Travel Time Truck (min)","Avg Travel Time Bus (min)",
+            "Avg Waiting Time Passenger (min)","Avg Waiting Time Truck (min)","Avg Waiting Time Bus (min)",
+            "Completed Passenger","Completed Truck","Completed Bus",
+            "Total Kilometers Traveled (All)","Total Completed Vehicles",
+            "Total Missing Vehicles","Total Inserted Not Completed"
+        ]
+        for c in need:
+            if c not in df.columns:
+                df[c] = np.nan
+
+        # Derived columns
+        df["Total Lost+Uninserted Vehicles"] = (
+            df["Total Missing Vehicles"].fillna(0) +
+            df["Total Inserted Not Completed"].fillna(0)
+        )
+
+        comp = pd.concat([
+            df["Completed Passenger"], df["Completed Truck"], df["Completed Bus"]
+        ], axis=1)
+        comp.columns = ["P","T","B"]
+
+        def wcol(names):
+            mat = pd.concat([df[n] if n in df.columns else pd.Series(np.nan, index=df.index) for n in names], axis=1)
+            mat.columns = ["P","T","B"]
+            return wavg_rowwise(mat, comp)
+
+        df["Weighted Avg Delay (min)"]        = wcol(["Avg Delay Passenger (min)","Avg Delay Truck (min)","Avg Delay Bus (min)"])
+        df["Weighted Avg TimeLoss (min)"]     = wcol(["Avg TimeLoss Passenger (min)","Avg TimeLoss Truck (min)","Avg TimeLoss Bus (min)"])
+        df["Weighted Avg Speed (km/h)"]       = wcol(["Avg Speed Passenger (km/h)","Avg Speed Truck (km/h)","Avg Speed Bus (km/h)"])
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            df["Overall Avg Route Length (km)"] = (
+                df.get("Total Kilometers Traveled (All)", np.nan) /
+                df.get("Total Completed Vehicles", np.nan)
+            )
+
+        # Build feature matrix and select closest-to-mean
+        feat = df[DISTANCE_METRICS].astype(float)
+        feat = feat.apply(lambda c: c.fillna(c.mean()), axis=0).fillna(0.0)
+        means, stds = feat.mean(), feat.std(ddof=0).replace(0, np.nan)
+        z = (feat - means) / stds
+        z = z.fillna(0.0)
+        dists = np.sqrt((z ** 2).sum(axis=1))
+        best_idx = int(dists.idxmin())
+        chosen_row = df.loc[best_idx]
+        chosen_run = normalize_sim_label(chosen_row["Simulation"])
+
+        chosen[scenario] = (chosen_run, chosen_row)
+
+    return chosen
+
+# =========================
+# STEP 2: For ONLY the chosen run, extract per-TAZ origin & destination
+# =========================
+if not os.path.isdir(base_dir):
+    raise FileNotFoundError(f"Base directory not found: {base_dir}")
+
+origin_out_path = os.path.join(base_dir, "final_selected_TAZ_origin_closest_to_mean.xlsx")
+dest_out_path   = os.path.join(base_dir, "final_selected_TAZ_destination_closest_to_mean.xlsx")
+
+with pd.ExcelWriter(origin_out_path) as w_origin, pd.ExcelWriter(dest_out_path) as w_dest:
+    for folder in os.listdir(base_dir):
+        folder_path = os.path.join(base_dir, folder)
+        if not os.path.isdir(folder_path):
+            continue
+
+        sim_label = extract_sim_key(folder)
+        if not sim_label:
+            continue
+
+        summary_file = os.path.join(folder_path, "customized_summary_output.xlsx")
+        if not os.path.exists(summary_file):
+            # no overall summary in this folder
+            continue
+
+        print(f"\n🔎 Selecting closest-to-mean runs for: {sim_label}")
+        chosen_map = choose_run_closest_to_mean(summary_file)  # scenario -> (Sim_k, row)
+
+        # per-TAZ workbook
+        taz_book_path, sheetnames = open_taz_book(folder_path)
+        if not taz_book_path:
+            print(f"  ❌ No per-TAZ workbook found for '{sim_label}'. Skipping.")
+            continue
+
+        # For each scenario, pull ONLY the chosen run's per-TAZ origin/destination
+        for scenario in sheet_to_col.values():
+            if scenario not in chosen_map:
+                continue
+            chosen_run, chosen_row = chosen_map[scenario]
+
+            sheet_origin = find_best_sheet_name(sheetnames, scenario, "origin")
+            sheet_dest   = find_best_sheet_name(sheetnames, scenario, "destination")
+            if not sheet_origin and not sheet_dest:
+                print(f"  ⚠️ No matching per-TAZ sheets for scenario '{scenario}' in {taz_book_path}.")
+                continue
+
+            if sheet_origin:
+                df_o = read_per_taz_block(taz_book_path, sheet_origin, chosen_run)
+            else:
+                df_o = pd.DataFrame()
+
+            if sheet_dest:
+                df_d = read_per_taz_block(taz_book_path, sheet_dest, chosen_run)
+            else:
+                df_d = pd.DataFrame()
+
+            # annotate context and write/append per scenario + sim
+            if not df_o.empty:
+                df_o.insert(0, "Scenario", scenario)
+                df_o.insert(1, "Simulation Type", sim_label)
+                df_o.insert(2, "Chosen Run", chosen_run)
+                # optional: include the selection features from chosen_row if you want them repeated per block
+                df_o.to_excel(w_origin, sheet_name=f"{scenario[:28]}_orig", index=False, header=not w_origin.sheets.get(f"{scenario[:28]}_orig"))
+
+            if not df_d.empty:
+                df_d.insert(0, "Scenario", scenario)
+                df_d.insert(1, "Simulation Type", sim_label)
+                df_d.insert(2, "Chosen Run", chosen_run)
+                df_d.to_excel(w_dest, sheet_name=f"{scenario[:28]}_dest", index=False, header=not w_dest.sheets.get(f"{scenario[:28]}_dest"))
+
+print(f"\n📄 Per-TAZ ORIGIN (chosen runs only): {origin_out_path}")
+print(f"📄 Per-TAZ DESTINATION (chosen runs only): {dest_out_path}")
