@@ -1,0 +1,347 @@
+# twelve_images_ALL_VOLUMES_tiff_green_TAGGED.py
+# Adds per-(metric, O/D) corner tags across volumes: 1600→(a), 3000→(b), 5000→(c), 10000→(d), 20000→(e), 40000→(f)
+import os, re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ==========================
+# CONFIG
+# ==========================
+BASE_DIR  = r"D:\SUMO Files for Calgary Simulation\All SImulations"
+ORIGIN_XL = os.path.join(BASE_DIR, "final_selected_TAZ_dynamic_origin.xlsx")
+DEST_XL   = os.path.join(BASE_DIR, "final_selected_TAZ_dynamic_destination.xlsx")
+OUT_ROOT  = os.path.join(BASE_DIR, "figures_ALL_VOLUMES_ODxMetric_TIFF_Green")
+
+# Volumes in the desired tagging order
+VOLUMES = ["1600", "3000", "5000", "10000", "20000", "40000"]
+
+STEP_ORDER = [
+    "dynamicinitial",
+    "dynamicstep1", "dynamicstep2", "dynamicstep3",
+    "dynamicstep4", "dynamicstep5", "dynamicstep6",
+]
+
+METRICS = [
+    {"label":"Delay (min)",              "sheet":"AvgTimeLoss",
+     "col_cand":["Weighted Avg TimeLoss (min)"], "compute_weighted":("timeloss", True),
+     "weight":"completed", "delta_percent":True,  "tag":"Delay"},
+    {"label":"Avg Speed (km/h)",         "sheet":"AvgSpeed",
+     "col_cand":["Overall Avg Speed (km/h)"],    "compute_weighted":None,
+     "weight":"completed", "delta_percent":True,  "tag":"Speed"},
+    {"label":"Avg Distance (km/veh)",    "sheet":"AvgDistance",
+     "col_cand":["Avg Kilometers Traveled per Vehicle"], "compute_weighted":("avgdist_from_totals", True),
+     "weight":"completed", "delta_percent":True,  "tag":"AvgDistance"},
+    {"label":"Missing Vehicles (count)", "sheet":"MissingVehicles",
+     "col_cand":["Total Missing Vehicles"],      "compute_weighted":None,
+     "weight":"sum", "delta_percent":True, "tag":"Missing"},
+]
+
+TAZ_LIST = list(range(1, 21))
+EPS = 1e-6
+
+plt.rcParams["figure.dpi"] = 120
+plt.rcParams["font.size"] = 10
+
+LEVEL_CMAP = "Greens"
+DELTA_CMAP = "RdBu_r"
+
+# Corner tag placement
+FIG_CORNER_POS = (0.985, 0.985)
+FIG_CORNER_KW  = dict(ha="right", va="top", fontsize=14, fontweight="bold")
+
+# ==========================
+# Helpers (unchanged core + small additions)
+# ==========================
+def ncol(s: str) -> str:
+    return str(s).strip().lower().replace(" ", "").replace("_", "")
+
+def find_col(df: pd.DataFrame, name: str):
+    want = ncol(name)
+    for c in df.columns:
+        if ncol(c) == want:
+            return c
+    return None
+
+def ensure_weighted_metric(df: pd.DataFrame, mode: str):
+    if mode == "timeloss" and find_col(df, "Weighted Avg TimeLoss (min)"):
+        return
+    cP = find_col(df, "Completed Passenger")
+    cT = find_col(df, "Completed Truck")
+    cB = find_col(df, "Completed Bus")
+    if not all([cP, cT, cB]): return
+    for coln in [cP, cT, cB]: df[coln] = pd.to_numeric(df[coln], errors="coerce")
+    tp = find_col(df, "Avg TimeLoss Passenger (min)")
+    tt = find_col(df, "Avg TimeLoss Truck (min)")
+    tb = find_col(df, "Avg TimeLoss Bus (min)")
+    if not all([tp, tt, tb]): return
+    for coln in [tp, tt, tb]: df[coln] = pd.to_numeric(df[coln], errors="coerce")
+    den = df[cP].fillna(0) + df[cT].fillna(0) + df[cB].fillna(0)
+    num = df[tp].fillna(0)*df[cP].fillna(0) + df[tt].fillna(0)*df[cT].fillna(0) + df[tb].fillna(0)*df[cB].fillna(0)
+    df["Weighted Avg TimeLoss (min)"] = np.where(den>0, num/den, np.nan)
+
+def ensure_avg_distance_per_vehicle(df: pd.DataFrame):
+    if find_col(df, "Avg Kilometers Traveled per Vehicle"): return
+    tot_km = find_col(df, "Total Kilometers Traveled (All)")
+    comp   = find_col(df, "Total Completed Vehicles")
+    ins    = find_col(df, "Total Inserted Vehicles")
+    if not tot_km or (not comp and not ins): return
+    df[tot_km] = pd.to_numeric(df[tot_km], errors="coerce")
+    if comp: df[comp] = pd.to_numeric(df[comp], errors="coerce")
+    if ins:  df[ins]  = pd.to_numeric(df[ins],  errors="coerce")
+    denom = df[comp].where(df[comp].fillna(0)>0, other=df[ins].fillna(0) if ins else 0.0)
+    denom = denom.replace(0, np.nan)
+    df["Avg Kilometers Traveled per Vehicle"] = df[tot_km] / denom
+
+def read_metric_df(xl_path: str, sheet_key: str, origin_or_dest: str) -> pd.DataFrame:
+    xls = pd.ExcelFile(xl_path)
+    sheet_name = f"{sheet_key}_{origin_or_dest}"
+    if sheet_name not in xls.sheet_names:
+        cand = [s for s in xls.sheet_names if sheet_key.lower() in s.lower() and origin_or_dest in s.lower()]
+        if not cand: raise FileNotFoundError(f"Sheet not found: {sheet_name}")
+        sheet_name = cand[0]
+    df = pd.read_excel(xls, sheet_name=sheet_name)
+    if sheet_key.lower().startswith("avgtimeloss"): ensure_weighted_metric(df, mode="timeloss")
+    if sheet_key.lower().startswith("avgdistance"): ensure_avg_distance_per_vehicle(df)
+    return df
+
+def step_labels_pretty():
+    return [s.replace("dynamic","").replace("step","Step ").replace("initial","Initial").title()
+            for s in STEP_ORDER]
+
+def pick_metric_column(df: pd.DataFrame, col_cand: list[str], compute_tuple):
+    for name in col_cand:
+        c = find_col(df, name)
+        if c and pd.api.types.is_numeric_dtype(df[c]): return c
+    if compute_tuple:
+        mode, _ = compute_tuple
+        if mode == "timeloss":
+            ensure_weighted_metric(df, "timeloss")
+            c = find_col(df, "Weighted Avg TimeLoss (min)")
+            if c: return c
+        if mode == "avgdist_from_totals":
+            ensure_avg_distance_per_vehicle(df)
+            c = find_col(df, "Avg Kilometers Traveled per Vehicle")
+            if c: return c
+    id_like = {ncol(x) for x in ["Scenario","Simulation Type","TAZ","Simulation",
+                                 "Chosen Metric","Chosen Simulation","Chosen Value"]}
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]) and ncol(c) not in id_like:
+            return c
+    raise ValueError("No usable numeric metric column found.")
+
+def detect_available_ods_for_volume(origin_xl: str, volume: str) -> list[str]:
+    xls = pd.ExcelFile(origin_xl)
+    sheet_guess = next((s for s in xls.sheet_names if "origin" in s.lower()), xls.sheet_names[0])
+    df = pd.read_excel(xls, sheet_name=sheet_guess)
+    simc = find_col(df, "Simulation Type") or "Simulation Type"
+    ods = []
+    for val in df[simc].dropna().astype(str).unique():
+        m = re.search(rf"^{volume}\s*vehicles.*\((\d+\-\d+)\)", val, flags=re.I)
+        if m: ods.append(m.group(1))
+    def keyfn(s): a, b = s.split("-"); return (int(a), int(b))
+    return sorted(set(ods), key=keyfn)
+
+def per_taz_matrix_agg(df: pd.DataFrame, metric_col: str, volume: str, od_group: str,
+                       scenario: str, weight_rule: str) -> pd.DataFrame:
+    sim_col = find_col(df, "Simulation Type")
+    scen_col = find_col(df, "Scenario")
+    taz_col  = find_col(df, "TAZ")
+    pattern = rf"^{volume}\s*vehicles.*\({od_group}\)"
+    base_mask = df[sim_col].astype(str).str.contains(pattern, regex=True, na=False)
+    base = df[base_mask].copy()
+    if base.empty:
+        return pd.DataFrame(index=TAZ_LIST, columns=STEP_ORDER, dtype=float)
+
+    wc = wi = None
+    if weight_rule == "completed":
+        wc = find_col(base, "Total Completed Vehicles")
+        wi = find_col(base, "Total Inserted Vehicles")
+
+    out = pd.DataFrame(index=TAZ_LIST, columns=STEP_ORDER, dtype=float)
+    for step in STEP_ORDER:
+        step_key = step if scenario == "dry" else step.replace("dynamic","dynamicrain")
+        block = base[base[scen_col].astype(str).str.lower() == step_key].copy()
+        if block.empty:
+            continue
+        block[metric_col] = pd.to_numeric(block[metric_col], errors="coerce")
+        block[taz_col]    = pd.to_numeric(block[taz_col], errors="coerce")
+        if wc: block[wc]  = pd.to_numeric(block[wc], errors="coerce")
+        if wi: block[wi]  = pd.to_numeric(block[wi], errors="coerce")
+
+        vals = {}
+        for t in TAZ_LIST:
+            rows = block[block[taz_col] == t]
+            if rows.empty:
+                vals[t] = np.nan; continue
+            if weight_rule == "sum":
+                vals[t] = pd.to_numeric(rows[metric_col], errors="coerce").sum()
+            else:
+                if wc:
+                    w = pd.to_numeric(rows[wc], errors="coerce").fillna(0)
+                    if wi is not None:
+                        wi_s = pd.to_numeric(rows[wi], errors="coerce").fillna(0)
+                        w = w.where(w > 0, wi_s)
+                elif wi:
+                    w = pd.to_numeric(rows[wi], errors="coerce").fillna(0)
+                else:
+                    w = pd.Series(1.0, index=rows.index)
+                x = pd.to_numeric(rows[metric_col], errors="coerce")
+                mask = (w > 0) & x.notna()
+                vals[t] = float((x[mask]*w[mask]).sum()/w[mask].sum()) if mask.any() else np.nan
+        out[step] = pd.Series(vals)
+    out = out.reindex(TAZ_LIST)
+    out = out[[c for c in STEP_ORDER if c in out.columns]]
+    return out
+
+def compute_delta_percent_vs_rain(wet_df: pd.DataFrame, dry_df: pd.DataFrame) -> pd.DataFrame:
+    wet = wet_df.astype(float); dry = dry_df.astype(float)
+    denom = wet.replace(0, np.nan).abs()
+    delta = 100.0 * (wet - dry) / denom
+    both_zero = (wet.fillna(0).abs() < EPS) & (dry.fillna(0).abs() < EPS)
+    return delta.where(~both_zero, 0.0)
+
+# NEW: letter sequence + map helper
+LETTER_SEQ = ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)"]
+def tag_for_index(i: int) -> str:
+    return LETTER_SEQ[i] if 0 <= i < len(LETTER_SEQ) else f"({chr(97+i)})"
+
+# UPDATED: accept corner_tag and draw it
+def plot_one(volume: str, od_group: str, meta, df_o: pd.DataFrame, df_d: pd.DataFrame, out_dir: str, corner_tag: str):
+    col_o = pick_metric_column(df_o, meta["col_cand"], meta.get("compute_weighted"))
+    col_d = pick_metric_column(df_d, meta["col_cand"], meta.get("compute_weighted"))
+
+    dry_o = per_taz_matrix_agg(df_o, col_o, volume, od_group, "dry", meta["weight"])
+    wet_o = per_taz_matrix_agg(df_o, col_o, volume, od_group, "wet", meta["weight"])
+    dry_d = per_taz_matrix_agg(df_d, col_d, volume, od_group, "dry", meta["weight"])
+    wet_d = per_taz_matrix_agg(df_d, col_d, volume, od_group, "wet", meta["weight"])
+
+    all_vals = np.concatenate([dry_o.values.ravel(), wet_o.values.ravel(),
+                               dry_d.values.ravel(), wet_d.values.ravel()])
+    if np.isnan(all_vals).all():
+        print(f"  (no data for {volume}v, O/D {od_group}) — skipping")
+        return None
+
+    delta_o = compute_delta_percent_vs_rain(wet_o, dry_o) if meta["delta_percent"] else (wet_o - dry_o)
+    delta_d = compute_delta_percent_vs_rain(wet_d, dry_d) if meta["delta_percent"] else (wet_d - dry_d)
+    delta_label = "Δ (%) vs Rainfall" if meta["delta_percent"] else "Δ (Rainfall−Dry)"
+
+    steps_lbl = step_labels_pretty()
+    level_vals = np.concatenate([dry_o.values.ravel(), wet_o.values.ravel(),
+                                 dry_d.values.ravel(), wet_d.values.ravel()])
+    level_vals = level_vals[np.isfinite(level_vals)]
+    if level_vals.size == 0:
+        vmin_level, vmax_level = 0, 1
+    else:
+        vmin_level, vmax_level = np.nanpercentile(level_vals, [2, 98])
+        if vmin_level == vmax_level: vmax_level = vmin_level + 1e-6
+
+    delta_vals = np.concatenate([delta_o.values.ravel(), delta_d.values.ravel()])
+    delta_vals = delta_vals[np.isfinite(delta_vals)]
+    vmax_delta = np.nanpercentile(np.abs(delta_vals), 95) if delta_vals.size else 1.0
+    if vmax_delta <= 0: vmax_delta = 1.0
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 6.5), constrained_layout=True, sharex=True, sharey=False)
+    axes[0, 0].set_title("Dry", fontsize=12)
+    axes[0, 1].set_title("Rainfall", fontsize=12)
+    axes[0, 2].set_title("Δ (Rainfall−Dry)", fontsize=12)
+
+    im1 = axes[0, 0].imshow(dry_o.values, aspect="auto", vmin=vmin_level, vmax=vmax_level, cmap=LEVEL_CMAP)
+    im2 = axes[0, 1].imshow(wet_o.values, aspect="auto", vmin=vmin_level, vmax=vmax_level, cmap=LEVEL_CMAP)
+    im3 = axes[0, 2].imshow(delta_o.values, aspect="auto", vmin=-vmax_delta, vmax=vmax_delta, cmap=DELTA_CMAP)
+    axes[1, 0].imshow(dry_d.values, aspect="auto", vmin=vmin_level, vmax=vmax_level, cmap=LEVEL_CMAP)
+    axes[1, 1].imshow(wet_d.values, aspect="auto", vmin=vmin_level, vmax=vmax_level, cmap=LEVEL_CMAP)
+    axes[1, 2].imshow(delta_d.values, aspect="auto", vmin=-vmax_delta, vmax=vmax_delta, cmap=DELTA_CMAP)
+
+    for r, row_label in [(0, "Origin"), (1, "Destination")]:
+        axes[r, 0].set_yticks(range(len(TAZ_LIST)))
+        axes[r, 0].set_yticklabels([str(t) for t in TAZ_LIST])
+        axes[r, 0].set_ylabel(f"{row_label}\nAggregated zones (1–20)", fontsize=11)
+        for j in [1, 2]:
+            axes[r, j].set_yticks([])
+
+    for r in [0, 1]:
+        for j in range(3):
+            axes[r, j].set_xticks(range(len(STEP_ORDER)))
+            axes[r, j].set_xticklabels(steps_lbl, rotation=0)
+
+    cbar1 = fig.colorbar(im2, ax=[axes[0,0], axes[0,1], axes[1,0], axes[1,1]], fraction=0.03, pad=0.02)
+    cbar1.set_label(f"{meta['label']} (level)")
+    cbar2 = fig.colorbar(im3, ax=[axes[0,2], axes[1,2]], fraction=0.03, pad=0.02)
+    cbar2.set_label(delta_label)
+
+    # Draw the per-(metric, O/D, volume) tag
+    if corner_tag:
+        fig.text(FIG_CORNER_POS[0], FIG_CORNER_POS[1], corner_tag, transform=fig.transFigure, **FIG_CORNER_KW)
+
+    fig.suptitle(f"{volume} vehicles — O/D {od_group} — {meta['label']}: "
+                 f"Dry vs Rainfall (Aggregated zones × Steps) with Δ% (Rainfall baseline)", fontsize=13)
+
+    os.makedirs(out_dir, exist_ok=True)
+    safe_tag = re.sub(r'[\\/:*?"<>|]+','_', meta['tag'])
+    fname = os.path.join(out_dir, f"{safe_tag}__{volume}v__OD_{od_group}.tiff")
+    try:
+        fig.savefig(fname, dpi=600, format="tiff", pil_kwargs={"compression": "tiff_lzw"})
+    except TypeError:
+        fig.savefig(fname, dpi=600, format="tiff")
+    plt.close(fig)
+    return fname
+
+# ==========================
+# Main (with tag assignment)
+# ==========================
+def main():
+    if not os.path.exists(ORIGIN_XL) or not os.path.exists(DEST_XL):
+        raise FileNotFoundError("Input per-TAZ Excel files not found. Check ORIGIN_XL and DEST_XL paths.")
+    os.makedirs(OUT_ROOT, exist_ok=True)
+
+    # Pre-read metric sheets once per file
+    preloaded = {}
+    for meta in METRICS:
+        df_o = read_metric_df(ORIGIN_XL, meta["sheet"], "origin")
+        df_d = read_metric_df(DEST_XL,   meta["sheet"], "destination")
+        preloaded[meta["sheet"]] = (df_o, df_d)
+
+    # 1) Discover which O/Ds exist for each volume
+    vol_to_ods = {vol: set(detect_available_ods_for_volume(ORIGIN_XL, vol)) for vol in VOLUMES}
+    # Union of all O/Ds across volumes (so we can tag per O/D)
+    union_ods = set().union(*vol_to_ods.values())
+
+    # 2) Build a tag map: (metric_tag, od_group, volume) -> "(a)/(b)/..."
+    tag_map = {}
+    for od in sorted(union_ods, key=lambda s: (int(s.split('-')[0]), int(s.split('-')[1]))):
+        for meta in METRICS:
+            letter_idx = 0
+            for vol in VOLUMES:
+                if od in vol_to_ods.get(vol, set()):
+                    tag_map[(meta["tag"], od, vol)] = tag_for_index(letter_idx)
+                    letter_idx += 1
+            # if a volume missing for this O/D, it is simply not added (skipped)
+
+    out_files = []
+
+    # 3) Generate figures, now passing the appropriate tag
+    for vol in VOLUMES:
+        ods = sorted(vol_to_ods.get(vol, []), key=lambda s: (int(s.split('-')[0]), int(s.split('-')[1])))
+        if not ods:
+            print(f"Volume {vol}: no O/D groups found — skipping.")
+            continue
+
+        out_dir = os.path.join(OUT_ROOT, f"{vol}_vehicles")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"\n=== Volume {vol} vehicles — O/D groups: {ods} ===")
+
+        for od in ods:
+            for meta in METRICS:
+                corner_tag = tag_map.get((meta["tag"], od, vol), "")
+                print(f"Generating: {vol} vehicles — O/D {od} — {meta['label']} … tag {corner_tag or '(none)'}")
+                df_o, df_d = preloaded[meta["sheet"]]
+                fpath = plot_one(vol, od, meta, df_o, df_d, out_dir, corner_tag)
+                if fpath: out_files.append(fpath)
+
+    print("\nSaved TIFF figures under:", OUT_ROOT)
+    for f in out_files:
+        print("  ", f)
+
+if __name__ == "__main__":
+    main()
