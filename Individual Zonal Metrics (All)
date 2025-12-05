@@ -1,0 +1,425 @@
+import os
+import sys
+import re
+import xml.etree.ElementTree as ET
+import pandas as pd
+from collections import defaultdict
+
+# =========================
+# Configuration
+# =========================
+GROUP_NAMES = [
+    "dynamicinitial", "dynamicstep1", "dynamicstep2", "dynamicstep3", "dynamicstep4", "dynamicstep5", "dynamicstep6",
+    "dynamicraininitial", "dynamicrainstep1", "dynamicrainstep2", "dynamicrainstep3", "dynamicrainstep4", "dynamicrainstep5", "dynamicrainstep6",
+    "dynamicpoststep1", "dynamicpoststep2+dynamicsposttep2"
+]
+NUM_SIMULATIONS = 10
+ODTRIPS_FILE = "odtrips_merged.xml"
+OUTPUT_XL = "customized_summary_output_TAZ_withPenalty.xlsx"
+
+# Short aliases to keep sheet names under Excel's 31-char limit
+SHORT_ALIAS = {
+    "dynamicinitial": "dyn_init",
+    "dynamicstep1": "dyn_s1",
+    "dynamicstep2": "dyn_s2",
+    "dynamicstep3": "dyn_s3",
+    "dynamicstep4": "dyn_s4",
+    "dynamicstep5": "dyn_s5",
+    "dynamicstep6": "dyn_s6",
+    "dynamicraininitial": "rain_init",
+    "dynamicrainstep1": "rain_s1",
+    "dynamicrainstep2": "rain_s2",
+    "dynamicrainstep3": "rain_s3",
+    "dynamicrainstep4": "rain_s4",
+    "dynamicrainstep5": "rain_s5",
+    "dynamicrainstep6": "rain_s6",
+    "dynamicpoststep1": "post_s1",
+    "dynamicpoststep2+dynamicsposttep2": "post_s2_combo",
+}
+
+def make_sheet_name(group: str, perspective: str) -> str:
+    alias = SHORT_ALIAS.get(group, group)
+    name = f"{alias}_TAZ_{perspective}"
+    # Extra safety: sanitize forbidden chars and cap at 31 chars
+    name = re.sub(r'[:\\/*?\[\]]', '_', name).strip("'")
+    return name[:31]
+
+# =========================
+# Parsers & Metrics
+# =========================
+def parse_expected_with_taz(file_path):
+    """
+    From odtrips_merged.xml collect:
+      - expected_ids: set of vehicle IDs
+      - expected_by_type: dict vtype -> set(ids)
+      - trip_from_taz / trip_to_taz: dict vid -> TAZ (string)
+    """
+    expected_ids = set()
+    expected_by_type = defaultdict(set)
+    trip_from_taz, trip_to_taz = {}, {}
+
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+    for trip in root.findall(".//trip"):
+        vid = trip.get("id")
+        vtype = trip.get("type") or trip.get("vType")
+        if not vid or not vtype:
+            continue
+        base_type = vtype.strip().lower().split('@')[0]
+        vid = vid.strip()
+        expected_ids.add(vid)
+        expected_by_type[base_type].add(vid)
+
+        fr_taz = trip.get("fromTaz")
+        to_taz = trip.get("toTaz")
+        if fr_taz is not None:
+            trip_from_taz[vid] = str(fr_taz)
+        if to_taz is not None:
+            trip_to_taz[vid] = str(to_taz)
+
+    return expected_ids, expected_by_type, trip_from_taz, trip_to_taz
+
+def parse_inserted_veh_ids(file_path):
+    """From Veh-Rou XML: set of vehicle IDs that were inserted."""
+    ids = set()
+    if not os.path.exists(file_path):
+        return ids
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+    for v in root.findall(".//vehicle"):
+        vid = v.get("id")
+        if vid:
+            ids.add(vid.strip())
+    return ids
+
+def parse_Trip-Info_metrics(file_path):
+    """
+    From Trip-Info XML:
+      - completed_ids: set of vehicles that completed
+      - perveh: dict vid -> per-vehicle metrics (type, time_loss_min, travel_time_min, waiting_time_min, route_length_km, delay_min, speed_kmh)
+    """
+    completed_ids = set()
+    perveh = {}
+    if not os.path.exists(file_path):
+        return completed_ids, perveh
+
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+    for trip in root.findall(".//Trip-Info"):
+        vid = trip.get("id")
+        vtype = trip.get("type") or trip.get("vType")
+        if not vtype or not vid:
+            continue
+        base_type = vtype.strip().lower().split('@')[0]
+        vid = vid.strip()
+        try:
+            duration = float(trip.get("duration", 0.0))
+            waiting_time = float(trip.get("waitingTime", 0.0))
+            route_length = float(trip.get("routeLength", 0.0)) / 1000.0   # km
+            time_loss = float(trip.get("timeLoss", 0.0))
+            delay = (time_loss - waiting_time) / 60.0                     # minutes
+            duration_hr = duration / 3600.0
+            speed = (route_length / duration_hr) if duration_hr > 0 else 0.0
+
+            completed_ids.add(vid)
+            perveh[vid] = {
+                "type": base_type,
+                "time_loss_min": time_loss / 60.0,
+                "travel_time_min": duration / 60.0,
+                "waiting_time_min": waiting_time / 60.0,  # ORIGINAL avg waiting (base)
+                "route_length_km": route_length,
+                "delay_min": delay,
+                "speed_kmh": speed
+            }
+        except:
+            continue
+    return completed_ids, perveh
+
+def compute_avg(metric_dict):
+    return {k: round(sum(v) / len(v), 2) if v else 0.0 for k, v in metric_dict.items()}
+
+def compute_weighted_time_loss(time_loss_dict):
+    total_weighted_sum = 0.0
+    total_completed = 0
+    for vt, vals in time_loss_dict.items():
+        if not vals:
+            continue
+        count = len(vals)
+        avg = sum(vals) / count
+        total_weighted_sum += avg * count
+        total_completed += count
+    return round(total_weighted_sum / total_completed, 2) if total_completed > 0 else 0.0
+
+def compute_total_kilometers(route_length_dict):
+    return {vt: round(sum(route_length_dict[vt]), 2) for vt in route_length_dict}
+
+def compute_weighted_avg_speed(route_lengths, durations):
+    total_length = sum(sum(route_lengths[vt]) for vt in route_lengths)
+    total_duration_min = sum(sum(durations[vt]) for vt in durations)
+    total_duration_hr = total_duration_min / 60.0
+    return round(total_length / total_duration_hr, 2) if total_duration_hr > 0 else 0.0
+
+# =========================
+# Per-TAZ aggregation
+# =========================
+def per_taz_table(expected_ids, inserted_ids, completed_ids, perveh_metrics,
+                  perspective, trip_from_taz, trip_to_taz):
+    """
+    Build per-TAZ table for 'origin' (fromTaz) or 'destination' (toTaz).
+    Paper notation included:
+      N   = total expected
+      Nc  = completed
+      Ninc = not inserted
+      Nm   = inserted but not completed
+      UTF = (Ninc + Nm) / N
+    """
+    # vehicle -> TAZ mapping
+    if perspective == "origin":
+        veh_taz = {vid: trip_from_taz[vid] for vid in expected_ids if vid in trip_from_taz}
+    else:
+        veh_taz = {vid: trip_to_taz[vid] for vid in expected_ids if vid in trip_to_taz}
+
+    # group by TAZ
+    taz_groups = defaultdict(set)
+    for vid, tz in veh_taz.items():
+        taz_groups[tz].add(vid)
+
+    rows = []
+    for taz, vids_expected in taz_groups.items():
+        vids_inserted  = vids_expected & inserted_ids
+        vids_completed = vids_expected & completed_ids
+
+        # Paper notation counts
+        N   = len(vids_expected)
+        Nc  = len(vids_completed)
+        Ninc = N - len(vids_inserted)     # not inserted
+        Nm   = len(vids_inserted) - Nc    # inserted but not completed
+        Missing = Ninc + Nm               # = N - Nc
+        UTF = round((Missing / N), 4) if N > 0 else 0.0
+
+        # Collect completed metrics by class
+        time_loss_by_type   = defaultdict(list)
+        travel_time_by_type = defaultdict(list)
+        waiting_by_type     = defaultdict(list)
+        route_length_by_type= defaultdict(list)
+        delay_by_type       = defaultdict(list)
+        speed_by_type       = defaultdict(list)
+        pooled_waiting = []
+
+        for vid in vids_completed:
+            m = perveh_metrics.get(vid)
+            if not m:
+                continue
+            vt = m["type"]
+            time_loss_by_type[vt].append(m["time_loss_min"])
+            travel_time_by_type[vt].append(m["travel_time_min"])
+            waiting_by_type[vt].append(m["waiting_time_min"])
+            route_length_by_type[vt].append(m["route_length_km"])
+            delay_by_type[vt].append(m["delay_min"])
+            speed_by_type[vt].append(m["speed_kmh"])
+            pooled_waiting.append(m["waiting_time_min"])
+
+        avg_time_loss   = compute_avg(time_loss_by_type)
+        avg_travel_time = compute_avg(travel_time_by_type)
+        avg_waiting     = compute_avg(waiting_by_type)
+        avg_route_len   = compute_avg(route_length_by_type)
+        avg_delay       = compute_avg(delay_by_type)
+        avg_speed       = compute_avg(speed_by_type)
+
+        total_km_by_type = compute_total_kilometers(route_length_by_type)
+        total_km_all = round(sum(total_km_by_type.values()), 2)
+
+        w_time_loss = compute_weighted_time_loss(time_loss_by_type)
+        overall_avg_speed = compute_weighted_avg_speed(route_length_by_type, travel_time_by_type)
+        original_avg_wait = round(sum(pooled_waiting) / len(pooled_waiting), 2) if pooled_waiting else 0.0
+
+        row = {
+            "TAZ": taz,
+            # Paper notation
+            "N (Total Expected)": N,
+            "Nc (Completed)": Nc,
+            "Ninc (Not Inserted)": Ninc,
+            "Nm (Inserted Not Completed)": Nm,
+            "UTF = (Ninc + Nm) / N": UTF,
+            # Convenience / compatibility
+            "Total Expected Vehicles": N,
+            "Total Inserted Vehicles": len(vids_inserted),
+            "Total Completed Vehicles": Nc,
+            "Total Missing Vehicles": Missing,
+            # Base for penalty formulas
+            "Original AvgWaiting (min)": original_avg_wait,
+            # Other summaries
+            "Weighted Avg TimeLoss (min)": w_time_loss,
+            "Overall Avg Speed (km/h)": overall_avg_speed,
+            "Total Kilometers Traveled (All)": total_km_all,
+        }
+
+        for vt in ["passenger", "truck", "bus"]:
+            row[f"Completed {vt.title()}"] = len([vid for vid in vids_completed if perveh_metrics.get(vid, {}).get("type") == vt])
+            row[f"Avg TimeLoss {vt.title()} (min)"] = avg_time_loss.get(vt, 0.0)
+            row[f"Avg Travel Time {vt.title()} (min)"] = avg_travel_time.get(vt, 0.0)
+            row[f"Avg Waiting Time {vt.title()} (min)"] = avg_waiting.get(vt, 0.0)
+            row[f"Avg Route Length {vt.title()} (km)"] = avg_route_len.get(vt, 0.0)
+            row[f"Avg Speed {vt.title()} (km/h)"] = avg_speed.get(vt, 0.0)
+            row[f"Avg Delay {vt.title()} (min)"] = avg_delay.get(vt, 0.0)
+            row[f"Total Kilometers {vt.title()}"] = total_km_by_type.get(vt, 0.0)
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        try:
+            df["TAZ"] = df["TAZ"].astype(int)
+            df = df.sort_values("TAZ").reset_index(drop=True)
+        except:
+            pass
+    return df
+
+def dry_counterpart(group_name: str) -> str:
+    """Map rain group to its dry counterpart; otherwise return unchanged."""
+    if "dynamicrain" in group_name:
+        return group_name.replace("dynamicrain", "dynamic")
+    return group_name
+
+def add_penalty_columns(df_target, df_dry_match):
+    """
+    Apply your penalty equations:
+      UTF = (Ninc + Nm) / N
+      For DRY groups:
+        Rainfall Penalty Factor = 0
+        Adjusted AvgWaiting = Original * (1 + UTF)
+      For RAIN groups:
+        Rainfall Penalty Factor = max(0, (Missing_rain - Missing_dry) / Inserted_rain)
+        Adjusted AvgWaiting = Original * (1 + UTF) * (1 + Rainfall Penalty Factor)
+    Match dry/rain by (Simulation, TAZ).
+    """
+    if df_target.empty:
+        return df_target
+
+    is_rain = df_target.attrs.get("is_rain", False)
+
+    # Build lookup for dry missing per (Simulation, TAZ)
+    dry_missing_lookup = {}
+    if not df_dry_match.empty:
+        for _, r in df_dry_match.iterrows():
+            dry_missing_lookup[(r["Simulation"], r["TAZ"])] = float(r.get("Total Missing Vehicles", 0))
+
+    rainfall_penalties = []
+    adjusted_waits = []
+
+    for _, r in df_target.iterrows():
+        sim = r["Simulation"]
+        taz = r["TAZ"]
+        utf = float(r.get("UTF = (Ninc + Nm) / N", 0.0))
+        orig_wait = float(r.get("Original AvgWaiting (min)", 0.0))
+
+        if is_rain:
+            missing_rain = float(r.get("Total Missing Vehicles", 0))
+            missing_dry = float(dry_missing_lookup.get((sim, taz), 0))
+            inserted_rain = float(r.get("Total Inserted Vehicles", 0))
+            if inserted_rain > 0:
+                rpf = max(0.0, (missing_rain - missing_dry) / inserted_rain)
+            else:
+                rpf = 0.0
+            adj = round(orig_wait * (1.0 + utf) * (1.0 + rpf), 4)
+        else:
+            rpf = 0.0
+            adj = round(orig_wait * (1.0 + utf), 4)
+
+        rainfall_penalties.append(round(rpf, 4))
+        adjusted_waits.append(adj)
+
+    df_target["Rainfall Penalty Factor"] = rainfall_penalties
+    df_target["Adjusted AvgWaiting (min)"] = adjusted_waits
+    return df_target
+
+# =========================
+# Main
+# =========================
+def main():
+    if not os.path.exists(ODTRIPS_FILE):
+        sys.exit(f"ERROR: '{ODTRIPS_FILE}' not found.")
+
+    expected_ids, expected_by_type, trip_from_taz, trip_to_taz = parse_expected_with_taz(ODTRIPS_FILE)
+
+    # Build per-group/perspective results (to compute rainfall penalty by matching dry ↔ rain)
+    results = {}  # (group, perspective) -> DataFrame
+
+    for group in GROUP_NAMES:
+        print(f"\nProcessing group: {group}")
+        for perspective in ("origin", "destination"):
+            frames = []
+            for i in range(1, NUM_SIMULATIONS + 1):
+                label = f"Sim_{i}"
+                parts = group.split("+")
+                Trip-Info_files = [f"{p}Trip-Info_{i}.xml" for p in parts]
+                Veh-Rou_files   = [f"{p}Veh-Rou_{i}.xml"   for p in parts]
+
+                inserted_ids = set()
+                completed_ids = set()
+                perveh_metrics = {}
+
+                for vf in Veh-Rou_files:
+                    inserted_ids.update(parse_inserted_veh_ids(vf))
+                for tf in Trip-Info_files:
+                    c_ids, perveh = parse_Trip-Info_metrics(tf)
+                    completed_ids.update(c_ids)
+                    perveh_metrics.update(perveh)
+
+                df = per_taz_table(
+                    expected_ids=expected_ids,
+                    inserted_ids=inserted_ids,
+                    completed_ids=completed_ids,
+                    perveh_metrics=perveh_metrics,
+                    perspective=perspective,
+                    trip_from_taz=trip_from_taz,
+                    trip_to_taz=trip_to_taz
+                )
+                if not df.empty:
+                    df.insert(0, "Simulation", label)
+                    frames.append(df)
+
+            all_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            results[(group, perspective)] = all_df
+
+    # Write all sheets with penalties applied and short names
+    with pd.ExcelWriter(OUTPUT_XL, engine="openpyxl", mode="w") as writer:
+        for group in GROUP_NAMES:
+            for perspective in ("origin", "destination"):
+                df = results.get((group, perspective), pd.DataFrame())
+
+                # tag whether this group is rain
+                is_rain = "dynamicrain" in group
+                df.attrs["is_rain"] = is_rain
+
+                # find dry counterpart to compute rainfall penalty (for rain groups)
+                if is_rain:
+                    dry_group = dry_counterpart(group)
+                    df_dry = results.get((dry_group, perspective), pd.DataFrame())
+                    df = add_penalty_columns(df, df_dry)
+                else:
+                    df = add_penalty_columns(df, pd.DataFrame())
+
+                # stable sorting within sheet: by Simulation index then numeric TAZ
+                if not df.empty:
+                    def sim_idx(s):
+                        try:
+                            return int(str(s).split("_")[1])
+                        except:
+                            return 10**9
+                    df["__sim_idx__"] = df["Simulation"].map(sim_idx)
+                    try:
+                        df["TAZ"] = df["TAZ"].astype(int)
+                    except:
+                        pass
+                    df = df.sort_values(["__sim_idx__", "TAZ"]).drop(columns="__sim_idx__").reset_index(drop=True)
+
+                sheet_name = make_sheet_name(group, perspective)
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print(f"\n✅ Done. Wrote per-TAZ Origin/Destination with penalties to '{OUTPUT_XL}'")
+    print("   UTF = (Ninc + Nm) / N; Rain Penalty = max(0, (Missing_rain - Missing_dry) / Inserted_rain)")
+    print("   Adjusted AvgWaiting: dry = Original*(1+UTF); rain = Original*(1+UTF)*(1+RainPenalty)")
+
+if __name__ == "__main__":
+    main()
