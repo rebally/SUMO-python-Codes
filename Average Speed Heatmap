@@ -1,0 +1,121 @@
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -------------------------------------------------------------------
+# Script: speedimage.py (Modified)
+# Description:
+#   Creates three TIFF heatmaps for the "AvgSpeed" sheet using dynamic scenarios.
+#   - Reversed color shading using Reds_r
+#   - Cleaner column labels without "dynamic" prefix
+# -------------------------------------------------------------------
+
+# 1) Configuration
+base_dir = r"D:\SUMO Files for Calgary Simulation\All results\NEW RESULTS WITH UPDATED OD\Dynamic"
+input_xl = os.path.join(base_dir, "final_selected_metrics.xlsx")
+
+# 2) Your dynamic sheet→column mapping
+sheet_to_col = {
+    "dynamicinitial":     "initial",
+    "dynamicraininitial": "raininitial",
+    "dynamicstep1":       "Step1",
+    "dynamicstep2":       "Step2",
+    "dynamicstep3":       "Step3",
+    "dynamicstep4":       "Step4",
+    "dynamicstep5":       "Step5",
+    "dynamicstep6":       "Step6",
+    "dynamicrainstep1":   "rainstep1",
+    "dynamicrainstep2":   "rainstep2",
+    "dynamicrainstep3":   "rainstep3",
+    "dynamicrainstep4":   "rainstep4",
+    "dynamicrainstep5":   "rainstep5",
+    "dynamicrainstep6":   "rainstep6",
+    "dynamicpoststep1":   "poststep1",
+    "dynamicpoststep2":   "poststep2",
+}
+
+# 3) Load the AvgSpeed sheet
+df = pd.read_excel(input_xl, sheet_name="AvgSpeed", index_col="Simulation Type")
+
+# 4) Re-order rows (optional)
+order = (
+    [f"{v} vehicles (8-8)"   for v in [1600, 3000, 5000, 10000, 20000]] +
+    [f"{v} vehicles (15-15)" for v in [1600, 3000, 5000, 10000, 20000]] +
+    [f"{v} vehicles (20-20)" for v in [1600, 3000, 5000, 10000, 20000, 40000]]
+)
+df = df.loc[order]
+
+# 5) Build interleaved column list and rename columns
+pairs = [
+    ("dynamicinitial", "dynamicraininitial")
+] + [
+    (f"dynamicstep{i}", f"dynamicrainstep{i}") for i in range(1, 7)
+]
+cols = [c for pair in pairs for c in pair]
+df = df[cols]
+df.rename(columns=sheet_to_col, inplace=True)
+
+# 6) Build cleaned-up pairs for plotting
+cleaned_pairs = [(sheet_to_col[b], sheet_to_col[r]) for b, r in pairs]
+cleaned_cols = [c for pair in cleaned_pairs for c in pair]
+
+# Helper to save TIFF heatmaps
+def save_heatmap(data, xticks, yticks, cmap, filename, cb_label, annotation=None):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.imshow(data, aspect="auto", cmap=cmap)
+    ax.set_xticks(range(len(xticks)))
+    ax.set_xticklabels(xticks, rotation=45, ha="right")
+    ax.set_yticks(range(len(yticks)))
+    ax.set_yticklabels(yticks)
+    plt.colorbar(im, label=cb_label, ax=ax)
+    if annotation:
+        fig.text(
+            0.01, 0.98, annotation,
+            transform=fig.transFigure,
+            ha='left', va='top',
+            fontsize=16, fontweight='bold'
+        )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    out_path = os.path.join(base_dir, filename)
+    fig.savefig(out_path, format="tiff", dpi=300)
+    plt.close(fig)
+    print(f"✅ Saved {filename}")
+
+# 6a) Pure-red heatmap
+save_heatmap(
+    df[cleaned_cols].values, cleaned_cols, df.index,
+    cmap="Reds_r",
+    filename="avgspeed_heatmap1.tiff",
+    cb_label="Average Speed (km/h)",
+    annotation="(c)"
+)
+
+# 6b) Absolute rain–base difference heatmap
+diff = pd.DataFrame(index=df.index)
+for base, rain in cleaned_pairs:
+    diff[f"{rain}-{base}"] = df[rain] - df[base]
+diff_cols = diff.columns.tolist()
+
+save_heatmap(
+    diff[diff_cols].values, diff_cols, diff.index,
+    cmap="Reds_r",
+    filename="avgspeed_heatmap_diff.tiff",
+    cb_label="Decrease in Average Speed (km/h)",
+    annotation="(a)"
+)
+
+# 6c) Percentage decrease heatmap
+pct = pd.DataFrame(index=df.index)
+for base, rain in cleaned_pairs:
+    pct[f"{rain}-{base}"] = (df[rain] - df[base]) / df[base] * 100
+pct_cols = pct.columns.tolist()
+
+save_heatmap(
+    pct[pct_cols].values, pct_cols, pct.index,
+    cmap="Greens_r",
+    filename="avgspeed_heatmap_pct.tiff",
+    cb_label="Decrease in Average Speed in Rainfall vs Without Rainfall Scenarios(%)",
+    annotation="(b)"
+)
+
+print("\n✅ All average speed heatmaps generated and saved.")
